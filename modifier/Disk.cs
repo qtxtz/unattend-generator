@@ -221,7 +221,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     StringWriter writer = new();
     writer.WriteLine($"""
       Function Fail(message)
-        WScript.Echo message & " Windows Setup will halt to avoid potential data loss."
+        WScript.Echo message
         WScript.Quit 1
       End Function
 
@@ -281,6 +281,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
         """);
     }
     writer.WriteLine("""
+      WScript.Echo "Disk assertions were satisfied."
       WScript.Quit 0
       """);
 
@@ -315,20 +316,22 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       }
     }
 
+    writer.WriteLine("@echo off");
+
     {
       if (configuration.LanguageSettings is UnattendedLanguageSettings settings)
       {
         var pair = settings.LocaleAndKeyboard;
         writer.WriteLine($"""
-	        rem Set keyboard layout
-	        wpeutil.exe SetKeyboardLayout {pair.Locale.LCID}:{pair.Keyboard.Id}
+          call :print "Setting keyboard layout for PE session"
+          wpeutil.exe SetKeyboardLayout {pair.Locale.LCID}:{pair.Keyboard.Id}
 
-	        """);
+          """);
       }
     }
 
     writer.WriteLine($"""
-      @for %%d in ({letters.Except([.. skippedDrives, bootDrive, windowsDrive, recoveryDrive]).JoinString(' ')}) do @(
+      for %%d in ({letters.Except([.. skippedDrives, bootDrive, windowsDrive, recoveryDrive]).JoinString(' ')}) do (
           if exist %%d:\sources\install.wim set "IMAGE_FILE=%%d:\sources\install.wim"
           if exist %%d:\sources\install.esd set "IMAGE_FILE=%%d:\sources\install.esd"
           if exist %%d:\sources\install.swm set "IMAGE_FILE=%%d:\sources\install.swm" & set "SWM_PARAM=/SWMFile:%%d:\sources\install*.swm"
@@ -339,14 +342,14 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     if (configuration.VirtIoGuestTools)
     {
       writer.WriteLine($"""
-	      if exist %%d:\virtio-win-guest-tools.exe set "VIRTIO_DRIVE=%%d:"
-	      """);
+        if exist %%d:\virtio-win-guest-tools.exe set "VIRTIO_DRIVE=%%d:"
+        """);
     }
     writer.WriteLine($"""
       )
       for /f "tokens=3" %%t in ('reg.exe query HKLM\System\Setup /v UnattendFile 2^>nul') do ( if exist %%t set "XML_FILE=%%t" )
-      @if not defined IMAGE_FILE echo Could not locate install.wim, install.esd or install.swm. & pause & exit /b 1
-      @if not defined XML_FILE echo Could not locate autounattend.xml. & pause & exit /b 1
+      if not defined IMAGE_FILE call :fail "Could not locate install.wim, install.esd or install.swm."
+      if not defined XML_FILE call :fail "Could not locate autounattend.xml."
   
       """);
 
@@ -359,8 +362,8 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       """);
 
     writer.WriteLine("""
-      rem Install drivers from $WinPEDriver$ folder
       if defined PEDRIVERS_FOLDER (
+          call :print "Loading drivers from $WinPEDriver$ folder"
           for /R %PEDRIVERS_FOLDER% %%f IN (*.inf) do drvload.exe "%%f"
       )
 
@@ -369,8 +372,8 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     if (configuration.VirtIoGuestTools)
     {
       writer.WriteLine("""
-        rem Install VirtIO drivers
         if defined VIRTIO_DRIVE (
+            call :print "Loading VirtIO drivers"
             drvload.exe "%VIRTIO_DRIVE%\vioscsi\w%OS_VERSION%\%PROCESSOR_ARCHITECTURE%\vioscsi.inf"
             drvload.exe "%VIRTIO_DRIVE%\NetKVM\w%OS_VERSION%\%PROCESSOR_ARCHITECTURE%\netkvm.inf"
         )
@@ -383,9 +386,10 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       if (IncludeSecondaryFile(Paths.AssertScript, assertScript))
       {
         writer.WriteLine($"""
-	        cscript.exe //E:vbscript "{Paths.AssertScript}" || ( pause & exit /b 1 )
+          call :print "Running disk assertions"
+          cscript.exe //E:vbscript "{Paths.AssertScript}" //Nologo || call :fail "Disk assertion failed. Windows Setup will halt to avoid potential data loss."
 
-	        """);
+          """);
       }
     }
 
@@ -410,17 +414,13 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       }
       IncludeSecondaryFile(Paths.DiskpartScript, diskpartScript);
 
-      if (pe.PauseBeforeFormatting)
-      {
-        writer.WriteLine("""
-        @echo diskpart will now partition and format your disk
-        pause
-        """);
-      }
       writer.WriteLine($"""
-      diskpart.exe /s {Paths.DiskpartScript} || ( echo diskpart.exe encountered an error. & pause & exit /b 1 )
+        
+        call :print "diskpart will now partition and format your disk"
+        {(pe.PauseBeforeFormatting ? "pause" : "")}
+        diskpart.exe /s {Paths.DiskpartScript} || call :fail "diskpart.exe encountered an error."
       
-      """);
+        """);
     }
 
     switch (pe.InstallFromSettings)
@@ -477,17 +477,18 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     }
 
     writer.WriteLine($"""
-      dism.exe /Apply-Image /ImageFile:%IMAGE_FILE% %SWM_PARAM% %IMG_PARAM% /ApplyDir:{windowsDrive}:\ {(pe.CompactOs ? "/Compact " : "")}/CheckIntegrity /Verify || ( echo dism.exe encountered an error. & pause & exit /b 1 )
-    
-      bcdboot.exe {windowsDrive}:\Windows /s {bootDrive}: || ( echo bcdboot.exe encountered an error. & pause & exit /b 1 )
+      call :print "Applying Windows image to target disk"
+      dism.exe /Apply-Image /ImageFile:%IMAGE_FILE% %SWM_PARAM% %IMG_PARAM% /ApplyDir:{windowsDrive}:\ {(pe.CompactOs ? "/Compact " : "")}/CheckIntegrity /Verify || call :fail "dism.exe encountered an error."
 
+      call :print "Making system partition bootable"
+      bcdboot.exe {windowsDrive}:\Windows /s {bootDrive}: || call :fail "bcdboot.exe encountered an error."
       """);
-
+    
     {
       void DeleteWinRE()
       {
         writer.WriteLine($"""
-        rem Avoid creation of recovery partition
+        call :print "Deleting winre.wim file to avoid creation of recovery partition"
         del {windowsDrive}:\Windows\System32\Recovery\winre.wim
         
         """);
@@ -523,6 +524,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     }
 
     writer.WriteLine($"""
+      call :print "Copying answer file to target disk"
       mkdir {windowsDrive}:\Windows\Panther
       copy %XML_FILE% {windowsDrive}:\Windows\Panther\unattend.xml
     
@@ -530,6 +532,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
 
     writer.WriteLine($"""
       if defined PEDRIVERS_FOLDER (
+          call :print "Adding drivers from $WinPEDriver$ folder to new installation"
           dism.exe /Add-Driver /Image:{windowsDrive}:\ /Driver:"%PEDRIVERS_FOLDER%" /Recurse
       )
 
@@ -539,8 +542,9 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     {
       writer.WriteLine($"""
         if defined VIRTIO_DRIVE (
-            dism.exe /Add-Driver /Image:{windowsDrive}:\ /Driver:"%VIRTIO_DRIVE%\vioscsi\w%OS_VERSION%\%PROCESSOR_ARCHITECTURE%\vioscsi.inf"
-            dism.exe /Add-Driver /Image:{windowsDrive}:\ /Driver:"%VIRTIO_DRIVE%\NetKVM\w%OS_VERSION%\%PROCESSOR_ARCHITECTURE%\netkvm.inf"
+          call :print "Adding VirtIO drivers to new installation"
+          dism.exe /Add-Driver /Image:{windowsDrive}:\ /Driver:"%VIRTIO_DRIVE%\vioscsi\w%OS_VERSION%\%PROCESSOR_ARCHITECTURE%\vioscsi.inf"
+          dism.exe /Add-Driver /Image:{windowsDrive}:\ /Driver:"%VIRTIO_DRIVE%\NetKVM\w%OS_VERSION%\%PROCESSOR_ARCHITECTURE%\netkvm.inf"
         )
 
         """);
@@ -550,6 +554,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       if (configuration.TimeZoneSettings is ExplicitTimeZoneSettings settings)
       {
         writer.WriteLine($"""
+          call :print "Setting time zone" 
           dism.exe /Image:{windowsDrive}:\ /Set-TimeZone:"{settings.TimeZone.Id}"
 
           """);
@@ -559,7 +564,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     if (pe.Disable8Dot3Names)
     {
       writer.WriteLine($"""
-        rem Strip 8.3 file names
+        call :print "Disabling 8.3 file names"
         fsutil.exe 8dot3name set {windowsDrive}: 1
         fsutil.exe 8dot3name strip /s /f {windowsDrive}:\
 
@@ -569,7 +574,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     if (pe.DisableDefender)
     {
       writer.WriteLine($"""
-        rem Disable Windows Defender
+        call :print "Disabling Windows Defender"
         reg.exe LOAD HKLM\mount {windowsDrive}:\Windows\System32\config\SYSTEM
         for %%s in (Sense WdBoot WdFilter WdNisDrv WdNisSvc WinDefend) do reg.exe ADD HKLM\mount\ControlSet001\Services\%%s /v Start /t REG_DWORD /d 4 /f
         reg.exe UNLOAD HKLM\mount
@@ -580,7 +585,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     if (configuration.DisableWpbt)
     {
       writer.WriteLine($"""
-        rem Disable WPBT
+        call :print "Disabling WPBT"
         reg.exe LOAD HKLM\mount {windowsDrive}:\Windows\System32\config\SYSTEM
         reg.exe add "HKLM\mount\ControlSet001\Control\Session Manager" /v DisableWpbtExecution /t REG_DWORD /d 1 /f
         reg.exe UNLOAD HKLM\mount
@@ -593,7 +598,7 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       {
         GeoLocation location = settings.GeoLocation;
         writer.WriteLine($"""
-          rem Set device setup region to {location.DisplayName} (GeoID {location.Id})
+          call :print "Setting device setup region to {location.DisplayName} (GeoID {location.Id})"
           reg.exe LOAD HKLM\mount {windowsDrive}:\Windows\System32\config\SOFTWARE
           reg.exe ADD "HKLM\mount\Microsoft\Windows\CurrentVersion\Control Panel\DeviceRegion" /v DeviceRegion /t REG_DWORD /d {location.Id} /f
           reg.exe UNLOAD HKLM\mount
@@ -605,12 +610,12 @@ class DiskModifier(ModifierContext context) : Modifier(context)
     if (configuration.UseConfigurationSet)
     {
       writer.WriteLine($"""
-        rem Copy $OEM$ folder if present
         set "ROBOCOPY_ARGS=/E /XX /COPY:DAT /DCOPY:DAT /R:0"
         if defined OEM_FOLDER (
+            call :print "Copying contents of $OEM$ folder"
             if exist "%OEM_FOLDER%\$$" robocopy.exe "%OEM_FOLDER%\$$" {windowsDrive}:\Windows %ROBOCOPY_ARGS%
             if exist "%OEM_FOLDER%\$1" robocopy.exe "%OEM_FOLDER%\$1" {windowsDrive}:\ %ROBOCOPY_ARGS%
-            @for %%d in ({letters.Except(skippedDrives).JoinString(' ')}) do @(
+            for %%d in ({letters.Except(skippedDrives).JoinString(' ')}) do (
                 if exist "%OEM_FOLDER%\%%d" robocopy.exe "%OEM_FOLDER%\%%d" %%d:\ %ROBOCOPY_ARGS%
             )
         )
@@ -618,19 +623,24 @@ class DiskModifier(ModifierContext context) : Modifier(context)
         """);
     }
 
-    if (pe.PauseBeforeReboot)
-    {
-      writer.WriteLine("""
-        @echo Computer will now reboot
-        pause
-
-        """);
-    }
-
-    writer.WriteLine("""
-      rem Continue with next stage of Windows Setup after reboot
+    writer.WriteLine($"""
+      call :print "Computer will now reboot"
+      {(pe.PauseBeforeReboot ? "pause": "")}
       wpeutil.exe reboot
+      goto :eof
 
+      :fail
+      echo:
+      echo:Fatal error: %~1
+      echo:
+      pause
+      exit 1
+
+      :print 
+      echo:
+      echo:*** %~1 ***
+      echo:
+      goto :eof
       """);
 
     return Util.SplitLines(writer.ToString());

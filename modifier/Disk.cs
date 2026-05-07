@@ -48,6 +48,8 @@ public record class NameInstallFromSettings(
   string Name
 ) : IInstallFromSettings;
 
+public class InteractiveInstallFromSettings : IInstallFromSettings;
+
 public interface IPESettings;
 
 public record class DefaultPESettings(
@@ -435,6 +437,16 @@ class DiskModifier(ModifierContext context) : Modifier(context)
       case NameInstallFromSettings nameSettings:
         writer.WriteLine($"""
           set "IMG_PARAM=/Name:"{nameSettings.Name}""
+          """);
+        break;
+
+      case InteractiveInstallFromSettings:
+        writer.WriteLine($"""
+          dism.exe /Get-WimInfo /WimFile:"%IMAGE_FILE%"
+          echo:
+          :choice
+          set /p "CHOICE=Enter index of the image you want to install:" || goto :choice
+          set "IMG_PARAM=/Index:%CHOICE%"
           """);
         break;
 
